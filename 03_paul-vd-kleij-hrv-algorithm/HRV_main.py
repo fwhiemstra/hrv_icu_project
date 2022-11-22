@@ -1,96 +1,101 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# -*- coding: utf-8 -*-
 """
 HRV analysis
-Created: 03/2022 - 05/2022
-Python v3.8.8
-Author: F. Smits
+Created: 01/03/2022
+Last update: 06/11/2022
+Python v3.9.5 ('base': conda)
+Author: P.A. van der Kleij
 
 Basic algorithm for heart rate variability (HRV) analysis. This script was 
 written during a Technical Medicine year 2 internship (TM2). The purpose of the
-algorithm is to analyze the HRV of ICU patients. Further improvements include:
-    - Adding timestamps to the outputfile in order to be able to analyze
-      circadian rhythms
-    - Improving artefact detection
+algorithm is to analyze the HRV of ICU patients.
 
 Make sure the following files are stored in the same folder before running:
     - HRV_main.py
     - HRV_preprocessing.py
+    - HRV_detection.py
     - HRV_calculations.py
-    - HRV_batchmode.py
     - files_id.txt
     
-Output variables: 
-    - batch_df: list containing dataframes with timestamps, raw- and filtered
-      ECG signals per included patient
-    - batch_nni: list containing arrays with nni per included patient [ms]
-    - batch_nni_first: list containing arrays with nni per included patient 
-      [ms], before ectopic beat- and outlier removal
-    - batch_rpeaks: list containing arrays with rpeak locations [s]
-    - batch_rpeaks_first: list containing array with rpeak locations [s]-
-      before ectopic beat- and outlier removal
+Output file: 
+    - patient_hrvdata_{pt}.csv file containing all calculated HRV parameters for consecutive
+      time segments including timestamp. Note; if multiple 
 
-Output file: the output file is stored in the same folder as the current file.
-    - HRVparameters.csv: file containing all calculated HRV parameters per 
-      included patient for the first hour of ECG recording. Rows = patients,
-      columns = HRV parameters
-    - per5min.csv: file containing mean calculcated HRV parameters per 5-minute
-      segment per included patient for the first hour of ECG recording. Rows =
-      patients, columns = HRV parameters
 """
 #%% Required modules
 import numpy as np
-import HRV_batchmode as workflow
-import HRV_evaluation as viseval
-import HRV_window as window
+import pandas as pd
 
+# Import HRV modules
+import HRV_detection
+import HRV_preprocessing
+import HRV_calculations
 
-#%% HRV calculations for specified time with a specified window
-# Specify input variables
-patient_ids = 'files_id.txt'                                               # .txt file containing patient_IDs
-sampfreq = 125                                                                  # Sample frequency in Hertz [Hz]
-lead = 'II'                                                                     # ECG lead to analyze 
-HRVwindow = 3                                                                   # Number of minutes you want to analyze the HRV
-Startmin = 10                                                                   # Specify after how many minutes analysis must start
-Durationmin = 6                                                                # Specify period of analysis in minutes
-export = list()             
+#%% Specify initial variables
 
-starttime, endtime = window.create_window(HRVwindow, Startmin, Durationmin)
+pt_records_file = 'pt_records_mm4.txt'                                          # .txt file containing patient_IDs
+sampfreq = 62.4725*4                                                            # Sample frequency in Hertz [Hz]
+lead = ['II']                                                                   # ECG lead to analyze
 
-# Calculate HRV parameters per specified window segments
-for i in np.arange(0, len(starttime), 1):
-    # HRV calculations for all patients specified in patient_ids
-    batch_df, batch_nni_first, batch_rpeaks_first, batch_nni, batch_rpeaks, export_all = workflow.workflow_batch(patient_ids, 
-                                                                                                                 sampfreq, lead, 
-                                                                                                                 starttime[i], endtime[i], 
-                                                                                                                 HRVwindow)
+startmin = 10                                                                   # Specify after how many minutes analysis must start
+windowmin = 5                                                                   # Number of minutes you want to analyze the HRV in for each analytical window
+segmentmin = 60                                                                 # Specify the length of each segment. Note 1 window will represent the entire segment
+segmentamount = 24                                                              # Specify the amount of segments you want to analyse
+
+lst_all = []                                                                    # Create empty dataframe for future storage of hrv_parameters
+pt_timepoints = []                                                                # Create empty list for future storage of time-axis
+#%% Preprocessing
+'''
+After defining the initial variables, preprocessing will first define the windows we must analyze and the patient ID's that are required.
+Thereafter the data will be loaded  
+'''
+starttimes, stoptimes = HRV_preprocessing.create_window(startmin, windowmin, segmentmin, segmentamount)     # Create lists with specified start- and stoptimes for analysis
+pt_records = HRV_preprocessing.load_pts(pt_records_file)                              # From the patient records file, extract patient record names
+
+for ind_pt, pt in enumerate(pt_records):
+    print(f'---- Start calculations for patient: {ind_pt + 1} ----')
+    for ind_time, (start, stop) in enumerate(zip(starttimes, stoptimes)):
+        for start_sec in np.arange(start, start+60*(segmentmin-windowmin), windowmin*60):
+            print(f'Calculate segment {ind_time+1}/{segmentamount}, trying starttime: {start_sec/60} min')
+            stop_sec = start_sec + windowmin*60
+            ecg_record, pt_path, w_record_name, database_name, record_dir, w_record_header = HRV_preprocessing.load_data(pt, sampfreq, start_sec, stop_sec, lead)
+
+            ecg_df = HRV_preprocessing.ecg_dataframe(ecg_record, sampfreq)
+            
+            # (Artefact) Detection
+            '''
+            Stukje uitleg over dit gedeelte van de code
+            '''
+            ecg_df, clipping = HRV_detection.clipping(ecg_df, sampfreq)
+            pacing = HRV_detection.pacespike(ecg_df)
+            ecg_df, r_peaks_first, ecg_filtered, ecg_analysis, valid_signal = HRV_detection.ecg_rpeak(ecg_df, sampfreq)
+            if ecg_analysis == 1:
+                print(f'try next time segment: no peak detection')
+                continue
+            r_peaks_first, nni_first, noisepeak = HRV_detection.peakprominence(r_peaks_first, ecg_df, ecg_filtered, sampfreq)
+            r_peaks, nni = HRV_detection.ecg_ectopic_removal(r_peaks_first, nni_first)
+            valid_signal = HRV_detection.ecg_check(noisepeak, pacing, clipping, ecg_analysis, windowmin, sampfreq, nni)
+            if valid_signal == False:
+                continue
+            pt_timepoints += [ecg_df.at[0,'TimeStamp']]
+            break
+
+        if valid_signal == False:
+            raise Exception(f"There was no good signal for the current segment (#{ind_time + 1})")
     
-    export_all.insert(0, 'time [min]', starttime[i]/60)
-    export.append(export_all)  
+        # Heart Rate Variability Calculations
+        '''
+        Stukje uitleg over dit gedeelte van de code
+        '''
+        hrv_parameters = HRV_calculations.hrv_calculations(nni, sampfreq, windowmin)
+        lst_all, tuplekeys = HRV_calculations.to_dataframe(hrv_parameters, ind_time, lst_all) 
 
- 
-exp = export[0]
-for i in np.arange(0, len(starttime)-1, 1):
-    exp = exp.append(export[i+1]) 
+        print(f'Done with calculations of segment {ind_time + 1}/{segmentamount}')
 
-exp['patientID'] = exp.index
-exp = exp.sort_values(['patientID', 'time [min]'])                              # Sort by patient, by time
-exp.to_csv('pacing.csv')                                                       # Export dataframe to .csv file
-
-#%% Visual evaluation 
-   
-viseval.visual_evaluation_rpeaks(batch_df, batch_rpeaks)                        # Visual evaluation of R-peak detection             
-viseval.visual_evaluation_nni(batch_nni, batch_rpeaks, batch_nni_first,         # Visual evaluation of NNI correction
-                              batch_rpeaks_first)    
-
-#%% Create histogram per HRV parameter, icluding mean and standard deviation
-    
-# Manually select .csv file of choice (stored in same folder)
-result = viseval.hrv_distribution('per5minhourresults.csv')                                    # Create histograms                               
-
-    
-
-
-
+        if ind_time == segmentamount - 1:
+            df_hrv = pd.DataFrame(lst_all, columns=tuplekeys)
+            df_hrv['TimeStamp'] = pt_timepoints
+            df_hrv.to_csv(f'patient_hrvdata_{ind_pt+2}.csv')
+            print(f'Dataframe of patient {ind_pt} saved as .csv-file\n')
 
